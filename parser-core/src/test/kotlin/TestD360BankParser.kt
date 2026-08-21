@@ -9,6 +9,8 @@ import java.math.BigDecimal
 
 class D360BankParserTest {
 
+    // All fixtures use unmistakably synthetic identities, dates, suffixes, and values.
+
     @TestFactory
     fun `d360 parser covers representative scenarios`(): List<DynamicTest> {
         val parser = D360BankParser()
@@ -18,42 +20,65 @@ class D360BankParserTest {
                 name = "International online purchase (foreign amount, SAR conversion)",
                 message = """
                     International Online Purchase
-                    Amount: TRY 342.00 (SAR 27.51)
-                    Card: *1234 - VISA (Ecommerce)
+                    Amount: TRY 200.00 (SAR 12.34)
+                    Card: *0007 - VISA (Ecommerce)
                     Fee: SAR 0.00
-                    At: FEED ME
-                    Account number: *5678
+                    At: SYNTHETIC MERCHANT
+                    Account number: *0008
                     Country: Turkey
-                    On: 2026-07-08 22:08
+                    On: 2030-01-01 00:00
                 """.trimIndent(),
                 sender = "D360Bank",
                 expected = ExpectedTransaction(
-                    amount = BigDecimal("27.51"),
+                    amount = BigDecimal("12.34"),
                     currency = "SAR",
                     type = TransactionType.EXPENSE,
-                    merchant = "FEED ME",
-                    accountLast4 = "1234",
+                    merchant = "SYNTHETIC MERCHANT",
+                    accountLast4 = "0007",
                     isFromCard = true
                 ),
                 description = "Foreign purchase: record the parenthetical SAR amount, not the TRY figure or the Fee line."
             ),
             ParserTestCase(
+                name = "Synthetic UAH international purchase uses SAR conversion not fee",
+                message = """
+                    International Online Purchase
+                    Amount: UAH 300.00 (SAR 23.45)
+                    Card: *0007 - VISA (Ecommerce)
+                    Fee: SAR 0.00
+                    At: SYNTHETIC GAME STORE
+                    Account number: *0008
+                    Country: United States
+                    On: 2030-01-01 00:00
+                """.trimIndent(),
+                sender = "D360Bank",
+                expected = ExpectedTransaction(
+                    amount = BigDecimal("23.45"),
+                    currency = "SAR",
+                    type = TransactionType.EXPENSE,
+                    merchant = "SYNTHETIC GAME STORE",
+                    accountLast4 = "0007",
+                    isFromCard = true
+                ),
+                description = "Use the SAR conversion rather than the UAH authorization amount or the zero SAR fee."
+            ),
+            ParserTestCase(
                 name = "International ATM withdrawal (foreign amount, SAR conversion)",
                 message = """
                     International ATM Withdrawal
-                    Amount: TRY 219.98 (SAR 17.71)
-                    Card: *4321 - VISA
+                    Amount: TRY 400.00 (SAR 34.56)
+                    Card: *0007 - VISA
                     Fee: 0.00
                     At: CITY,TR
                     Country: Turkey
-                    On: 2026-07-08 15:33
+                    On: 2030-01-01 00:00
                 """.trimIndent(),
                 sender = "D360BANK",
                 expected = ExpectedTransaction(
-                    amount = BigDecimal("17.71"),
+                    amount = BigDecimal("34.56"),
                     currency = "SAR",
                     type = TransactionType.EXPENSE,
-                    accountLast4 = "4321",
+                    accountLast4 = "0007",
                     isFromCard = true
                 ),
                 description = "ATM withdrawal is an expense; SAR conversion is preferred over the TRY amount."
@@ -61,36 +86,36 @@ class D360BankParserTest {
             ParserTestCase(
                 name = "Incoming transfer (local SAR)",
                 message = """
-                    Incoming Transfer: SAMPLE BANK
-                    Amount: SAR 250.00
-                    From: *1234
+                    Incoming Transfer: SYNTHETIC BANK
+                    Amount: SAR 45.67
+                    From: *0008
                     IBAN: SA00
-                    at: 2026-07-08 18:14
+                    at: 2030-01-01 00:00
                 """.trimIndent(),
                 sender = "D360BANK",
                 expected = ExpectedTransaction(
-                    amount = BigDecimal("250.00"),
+                    amount = BigDecimal("45.67"),
                     currency = "SAR",
                     type = TransactionType.INCOME,
-                    merchant = "SAMPLE BANK"
+                    merchant = "SYNTHETIC BANK"
                 ),
                 description = "Incoming transfer is income; merchant is the counterparty on the title line."
             ),
             ParserTestCase(
                 name = "Outgoing transfer (local SAR)",
                 message = """
-                    Outgoing Transfer: SAMPLE BANK
-                    Amount: SAR 500.00
-                    To: *9876
+                    Outgoing Transfer: SYNTHETIC BANK
+                    Amount: SAR 56.78
+                    To: *0008
                     IBAN: SA00
-                    at: 2026-07-08 19:20
+                    at: 2030-01-01 00:00
                 """.trimIndent(),
                 sender = "D360BANK",
                 expected = ExpectedTransaction(
-                    amount = BigDecimal("500.00"),
+                    amount = BigDecimal("56.78"),
                     currency = "SAR",
                     type = TransactionType.EXPENSE,
-                    merchant = "SAMPLE BANK"
+                    merchant = "SYNTHETIC BANK"
                 ),
                 description = "Outgoing transfer is an expense; the 'at:' datetime line must not be picked as merchant."
             ),
@@ -98,23 +123,51 @@ class D360BankParserTest {
                 name = "Merchant name containing a promo substring still parses",
                 message = """
                     International Online Purchase
-                    Amount: SAR 88.00
-                    Card: *1234 - VISA (Ecommerce)
+                    Amount: SAR 67.89
+                    Card: *0007 - VISA (Ecommerce)
                     Fee: SAR 0.00
-                    At: WHOLESALE MARKET
-                    Account number: *5678
+                    At: SYNTHETIC WHOLESALE MARKET
+                    Account number: *0008
                     Country: Saudi Arabia
-                    On: 2026-07-08 12:00
+                    On: 2030-01-01 00:00
                 """.trimIndent(),
                 sender = "D360BANK",
                 expected = ExpectedTransaction(
-                    amount = BigDecimal("88.00"),
+                    amount = BigDecimal("67.89"),
                     currency = "SAR",
                     type = TransactionType.EXPENSE,
-                    merchant = "WHOLESALE MARKET",
+                    merchant = "SYNTHETIC WHOLESALE MARKET",
                     isFromCard = true
                 ),
                 description = "'sale' inside 'WHOLESALE' must not trip the promo filter (word-boundary match)."
+            ),
+            ParserTestCase(
+                name = "Account funding via Apple Pay is transfer",
+                message = """
+                    Account Funding via Apple Pay
+                    Amount: SAR 78.90
+                    Card: *0007 - VISA
+                    On: 2030-01-01 00:00
+                """.trimIndent(),
+                sender = "D360BANK",
+                expected = ExpectedTransaction(
+                    amount = BigDecimal("78.90"),
+                    currency = "SAR",
+                    type = TransactionType.TRANSFER,
+                    accountLast4 = "0007",
+                    isFromCard = true
+                )
+            ),
+            ParserTestCase(
+                name = "Declined purchase is not a transaction",
+                message = """
+                    International Online Purchase Declined
+                    Amount: SAR 12.34
+                    Card: *0007 - VISA
+                    Insufficient balance
+                """.trimIndent(),
+                sender = "D360BANK",
+                shouldParse = false
             ),
             ParserTestCase(
                 name = "Promotional SMS is not a transaction",
@@ -125,7 +178,7 @@ class D360BankParserTest {
             ),
             ParserTestCase(
                 name = "OTP is not a transaction",
-                message = "Your D360 Bank verification code is 123456. Do not share it with anyone.",
+                message = "Your D360 Bank verification code is <CODE>. Do not share it with anyone.",
                 sender = "D360BANK",
                 shouldParse = false,
                 description = "Verification codes must never be parsed as transactions."

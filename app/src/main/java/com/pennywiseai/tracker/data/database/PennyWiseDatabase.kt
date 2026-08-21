@@ -62,7 +62,7 @@ import com.pennywiseai.tracker.data.database.entity.UnrecognizedSmsEntity
  * that needs to record the version it was exported against. Bump this in lock-
  * step with any schema change.
  */
-const val SCHEMA_VERSION = 58
+const val SCHEMA_VERSION = 60
 
 /**
  * The PennyWise Room database.
@@ -127,7 +127,13 @@ const val SCHEMA_VERSION = 58
         AutoMigration(from = 55, to = 56),
         // 56→57 adds a nullable account_last4 column to subscriptions — a pure
         // additive change, so Room generates the ALTER TABLE automatically (#570).
-        AutoMigration(from = 56, to = 57)
+        AutoMigration(from = 56, to = 57),
+        // 58→59 adds nullable parser ownership-evidence columns to transactions.
+        // Existing rows preserve their legacy account semantics unchanged.
+        AutoMigration(from = 58, to = 59),
+        // 59→60 adds the nullable legacy-suffix role assertion. Historical rows
+        // remain null and therefore preserve pre-contract behavior.
+        AutoMigration(from = 59, to = 60)
     ]
 )
 @TypeConverters(Converters::class)

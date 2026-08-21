@@ -131,6 +131,8 @@ object BankParserFactory {
         ChaseBankParser(),  // Chase Bank (USA)
         AlRajhiBankParser(),  // Al Rajhi Bank (Saudi Arabia)
         SNBAlAhliBankParser(),  // Saudi National Bank / Al Ahli Bank (Saudi Arabia)
+        MobilyPayParser(),  // Mobily Pay (Saudi Arabia)
+        BarqParser(),  // Barq (Saudi Arabia)
         STCBankParser(),  // STC Bank (Saudi Arabia)
         SabbBankParser(),  // SABB - Saudi Awwal Bank (Saudi Arabia)
         D360BankParser(),  // D360 Bank (Saudi Arabia)

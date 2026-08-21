@@ -42,16 +42,27 @@ fun ParsedTransaction.toEntity(): TransactionEntity {
         smsBody = smsBody,
         bankName = bankName,
         smsSender = sender,
-        accountNumber = accountLast4,
+        // An explicit balance owner supersedes the legacy account/card hint only
+        // for the persisted primary account. When absent, existing parsers retain
+        // their previous accountLast4 behavior unchanged.
+        accountNumber = balanceOwner?.accountLast4 ?: accountLast4,
         balanceAfter = balance,
         transactionHash = transactionHash?.takeIf { it.isNotBlank() } ?: generateTransactionId(),
         isRecurring = false, // Will be determined later
         createdAt = LocalDateTime.now(),
         updatedAt = LocalDateTime.now(),
         currency = currency,
-        fromAccount = fromAccount,
-        toAccount = toAccount,
-        reference = reference
+        fromAccount = fromAccountIdentity?.accountLast4 ?: fromAccount,
+        toAccount = toAccountIdentity?.accountLast4 ?: toAccount,
+        reference = reference,
+        fundingInstrumentLast4 = fundingInstrumentLast4,
+        fundingInstrumentBankName = fundingInstrumentBankName,
+        balanceOwnerBankName = balanceOwner?.bankName,
+        balanceOwnerAccountLast4 = balanceOwner?.accountLast4,
+        balanceOwnerKind = balanceOwnerKind?.name,
+        fromBankName = fromAccountIdentity?.bankName,
+        toBankName = toAccountIdentity?.bankName,
+        accountLast4Role = accountLast4Role?.name
     )
 }
 

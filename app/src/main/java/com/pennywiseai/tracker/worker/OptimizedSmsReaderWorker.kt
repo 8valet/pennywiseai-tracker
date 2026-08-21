@@ -8,6 +8,7 @@ import android.util.Log
 import androidx.core.net.toUri
 import androidx.hilt.work.HiltWorker
 import androidx.work.*
+import com.pennywiseai.parser.core.BalanceOwnerKind
 import com.pennywiseai.parser.core.ParsedTransaction
 import com.pennywiseai.parser.core.bank.*
 import com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity
@@ -16,6 +17,8 @@ import com.pennywiseai.tracker.data.database.entity.CardType
 import com.pennywiseai.tracker.data.database.entity.TransactionType
 import com.pennywiseai.tracker.data.database.entity.UnrecognizedSmsEntity
 import com.pennywiseai.tracker.data.manager.TransactionDeduplication
+import com.pennywiseai.tracker.data.manager.qualifiedTransferLegsOrNull
+import com.pennywiseai.tracker.data.manager.reportedBalanceOwnerOrNull
 import com.pennywiseai.tracker.data.mapper.toEntity
 import com.pennywiseai.tracker.data.mapper.toEntityType
 import com.pennywiseai.tracker.utils.BalanceCalculator
@@ -96,6 +99,10 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
         private const val RESULT_CHANNEL_CAPACITY   = 512
         private const val UNRECOGNIZED_BATCH_SIZE   = 50
         private const val ETA_WINDOW_MS             = 2000L
+
+        // The public Telephony.Mms.Addr API exposes the TYPE column but not the
+        // PDU-header FROM value. MMS providers use 137 for incoming addresses.
+        private const val MMS_ADDRESS_TYPE_FROM     = 137
 
         private val SMS_PROJECTION = arrayOf(
             Telephony.Sms._ID,
@@ -722,11 +729,30 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
                 return@coroutineScope SaveOutcome.SKIPPED_DUPLICATE
             }
 
-            val rowId = transactionRepository.insertTransaction(finalEntity)
+            // Only explicit, bank-qualified legs may move two balances. A
+            // TRANSFER with one missing/ambiguous leg is still persisted but never
+            // invents a second account or inferred balance movement.
+            val transferLegs = finalEntity.qualifiedTransferLegsOrNull()
+            val rowId = if (transferLegs != null) {
+                accountBalanceRepository.insertTransferWithBalance(
+                    transaction = finalEntity,
+                    fromBankName = transferLegs.fromBankName,
+                    fromLast4 = transferLegs.fromAccountLast4,
+                    toBankName = transferLegs.toBankName,
+                    toLast4 = transferLegs.toAccountLast4
+                )
+            } else {
+                transactionRepository.insertTransaction(finalEntity)
+            }
             if (rowId == -1L) return@coroutineScope SaveOutcome.SKIPPED
 
             saveRuleApplications(rowId, ruleApps)
-            balanceUpdates.send(DeferredBalanceUpdate(parsed, finalEntity, rowId))
+            // Two-leg routing already recorded the authoritative transfer effect.
+            // All other transactions, including incomplete transfers with an
+            // explicit reported balance, use the ownership-aware balance path.
+            if (transferLegs == null) {
+                balanceUpdates.send(DeferredBalanceUpdate(parsed, finalEntity, rowId))
+            }
             SaveOutcome.SAVED
         }
     } catch (e: Exception) {
@@ -762,25 +788,29 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
         entity: com.pennywiseai.tracker.data.database.entity.TransactionEntity,
         rowId: Long
     ) {
-        val accountLast4 = parsed.accountLast4 ?: run {
-            // Mobile-money wallets (eMola, M-Pesa Mozambique) have no per-account
-            // number — the whole wallet is one account. Derive a service-level row
-            // from the running balance so a full re-scan also creates it, matching
-            // SmsTransactionProcessor.
-            if (parsed.isMobileWallet && parsed.balance != null) {
-                upsertWalletBalance(parsed, entity, rowId)
-            }
+        // The message can identify the funding card while reporting a wallet's
+        // running balance. Resolve an explicit balance owner first; older parsers
+        // retain their accountLast4/isFromCard behavior through the resolver.
+        val balanceOwner = parsed.reportedBalanceOwnerOrNull() ?: return
+        if (parsed.type.toEntityType() == TransactionType.TRANSFER && parsed.balance == null) {
+            // Incomplete transfers remain in history but cannot infer an account
+            // movement without a bank-reported balance or both qualified legs.
+            return
+        }
+        if (balanceOwner.kind == BalanceOwnerKind.SERVICE_WALLET) {
+            upsertWalletBalance(parsed, entity, rowId, balanceOwner.bankName)
             return
         }
 
-        val card = if (parsed.isFromCard) {
-            (cardRepository.getCard(parsed.bankName, accountLast4)
+        val accountLast4 = balanceOwner.accountLast4
+        val card = if (balanceOwner.kind == BalanceOwnerKind.CARD) {
+            (cardRepository.getCard(balanceOwner.bankName, accountLast4)
                 ?: run {
                     cardRepository.findOrCreateCard(
-                        accountLast4, parsed.bankName,
+                        accountLast4, balanceOwner.bankName,
                         isCredit = parsed.type.toEntityType() == TransactionType.CREDIT
                     )
-                    cardRepository.getCard(parsed.bankName, accountLast4)
+                    cardRepository.getCard(balanceOwner.bankName, accountLast4)
                 }
                 )?.also { c ->
                 cardRepository.updateCardBalance(
@@ -802,7 +832,7 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
         val isCreditCard = card?.cardType == CardType.CREDIT ||
                 parsed.type.toEntityType() == TransactionType.CREDIT
 
-        val existing = accountBalanceRepository.getLatestBalance(parsed.bankName, targetAccount)
+        val existing = accountBalanceRepository.getLatestBalance(balanceOwner.bankName, targetAccount)
 
         val resolvedIsCreditCard = isCreditCard || (existing?.isCreditCard ?: false)
 
@@ -825,7 +855,7 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
         }
 
         val balanceEntity = AccountBalanceEntity(
-            bankName      = parsed.bankName,
+            bankName      = balanceOwner.bankName,
             accountLast4  = targetAccount,
             balance       = newBalance,
             timestamp     = entity.dateTime,
@@ -859,15 +889,16 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
     private suspend fun upsertWalletBalance(
         parsed: ParsedTransaction,
         entity: com.pennywiseai.tracker.data.database.entity.TransactionEntity,
-        rowId: Long
+        rowId: Long,
+        walletBankName: String
     ) {
         val balance = parsed.balance ?: return
         val existing = accountBalanceRepository.getLatestBalance(
-            parsed.bankName,
+            walletBankName,
             AccountBalanceEntity.WALLET_ACCOUNT_MARKER
         )
         val balanceEntity = AccountBalanceEntity(
-            bankName      = parsed.bankName,
+            bankName      = walletBankName,
             accountLast4  = AccountBalanceEntity.WALLET_ACCOUNT_MARKER,
             balance       = balance,
             timestamp     = entity.dateTime,
@@ -882,7 +913,7 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
             lowBalanceThreshold = existing?.lowBalanceThreshold
         )
         accountBalanceRepository.insertBalance(balanceEntity)
-        Log.i(TAG, "Saved wallet balance for ${parsed.bankName}")
+        Log.i(TAG, "Saved wallet balance for $walletBankName")
     }
 
     // ─── Unrecognized SMS batch ────────────────────────────────────────────────
@@ -1007,7 +1038,7 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
             applicationContext.contentResolver.query(
                 "content://mms".toUri(),
                 arrayOf("COUNT(*)"),
-                "date >= ? AND tr_id LIKE 'proto:%'",
+                "date >= ? AND tr_id IS NOT NULL AND tr_id != ''",
                 arrayOf(scanStartSeconds.toString()),
                 null
             )?.use { c ->
@@ -1033,7 +1064,7 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
                 if (trIdIdx >= 0) {
                     while (c.moveToNext()) {
                         val trId = c.getString(trIdIdx)
-                        if (trId != null && trId.startsWith("proto:")) {
+                        if (MmsRcsMessageSupport.isRcsCandidate(trId)) {
                             count++
                         }
                     }
@@ -1100,11 +1131,18 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
                 while (c.moveToNext()) {
                     val messageId = c.getLong(c.getColumnIndexOrThrow("_id"))
                     val date      = c.getLong(c.getColumnIndexOrThrow("date"))
-                    val trId      = c.getColumnIndex("tr_id").takeIf { it >= 0 }
-                        ?.let { c.getString(it) } ?: continue
-                    if (!trId.startsWith("proto:")) continue
+                    val trId = c.getColumnIndex("tr_id").takeIf { it >= 0 }
+                        ?.let { c.getString(it) }
+                    if (!MmsRcsMessageSupport.isRcsCandidate(trId)) continue
 
-                    val sender = extractRcsSender(trId) ?: continue
+                    // Keep proto rows on their established embedded-sender path. Other
+                    // MMS/RCS business rows (for example Samsung's T-prefixed IDs) obtain
+                    // their sender from the provider's incoming FROM address instead.
+                    val sender = if (MmsRcsMessageSupport.isProtoRcs(trId!!)) {
+                        extractRcsSender(trId)
+                    } else {
+                        extractMmsSender(messageId)
+                    } ?: continue
                     var text = getRcsMessageText(messageId) ?: continue
                     if (text.trim().startsWith("{")) text = extractTextFromRcsJson(text) ?: continue
 
@@ -1121,18 +1159,31 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
 
     // ─── RCS helpers ──────────────────────────────────────────────────────────
 
-    private fun extractRcsSender(trId: String): String? = try {
-        val decoded = String(android.util.Base64.decode(trId.removePrefix("proto:"), android.util.Base64.DEFAULT))
-        Regex("""([a-z_]+)_[a-z0-9]+_agent@rbm\.goog""").find(decoded)?.let { m ->
-            return m.groupValues[1].split("_")
-                .joinToString(" ") { if (it.isNotEmpty()) it.substring(0, 1).uppercase() + it.substring(1) else it }
+    /** Legacy proto sender decoding; isolated so its behavior remains unchanged. */
+    private fun extractRcsSender(trId: String): String? = MmsRcsMessageSupport.extractProtoSender(trId)
+
+    /**
+     * Resolves the incoming sender for MMS/RCS rows whose tr_id does not encode it.
+     * Android exposes inbound MMS addresses with type 137 (the MMS PDU FROM value).
+     */
+    private fun extractMmsSender(messageId: Long): String? = try {
+        applicationContext.contentResolver.query(
+            Telephony.Mms.Addr.getAddrUriForMessage(messageId.toString()),
+            arrayOf(Telephony.Mms.Addr.ADDRESS, Telephony.Mms.Addr.TYPE),
+            "${Telephony.Mms.Addr.TYPE} = ?",
+            arrayOf(MMS_ADDRESS_TYPE_FROM.toString()),
+            null
+        )?.use { c ->
+            val addressIdx = c.getColumnIndexOrThrow(Telephony.Mms.Addr.ADDRESS)
+            while (c.moveToNext()) {
+                MmsRcsMessageSupport.validMmsSender(c.getString(addressIdx))?.let { return it }
+            }
+            null
         }
-        Regex("""[\x12\x1a][\x00-\x20]([A-Za-z][A-Za-z\s]+)""").find(decoded)?.let { m ->
-            val name = m.groupValues[1].trim()
-            if (name.length in 4..49) return name
-        }
+    } catch (e: Exception) {
+        Log.w(TAG, "Unable to read MMS sender for $messageId: ${e.message}")
         null
-    } catch (_: Exception) { null }
+    }
 
     private fun getRcsMessageText(messageId: Long): String? = try {
         applicationContext.contentResolver.query(
@@ -1142,7 +1193,7 @@ class OptimizedSmsReaderWorker @AssistedInject constructor(
                 val ct = c.getColumnIndex("ct").takeIf { it >= 0 }?.let { c.getString(it) } ?: continue
                 if (!ct.startsWith("text/") && ct != "application/smil") continue
                 c.getColumnIndex("text").takeIf { it >= 0 }?.let { idx ->
-                    c.getString(idx)?.takeIf { it.isNotEmpty() }?.let { return it }
+                    MmsRcsMessageSupport.inlineTextPart(ct, c.getString(idx))?.let { return it }
                 }
                 val partId = c.getLong(c.getColumnIndexOrThrow("_id"))
                 try {

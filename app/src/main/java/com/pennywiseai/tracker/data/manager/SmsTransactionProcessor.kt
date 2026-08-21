@@ -2,6 +2,7 @@ package com.pennywiseai.tracker.data.manager
 
 import android.content.Context
 import android.util.Log
+import com.pennywiseai.parser.core.BalanceOwnerKind
 import com.pennywiseai.parser.core.ParsedTransaction
 import com.pennywiseai.parser.core.bank.BankParserFactory
 import com.pennywiseai.tracker.data.database.entity.AccountBalanceEntity
@@ -172,7 +173,18 @@ class SmsTransactionProcessor @Inject constructor(
                 entityWithRules
             }
 
-            val rowId = transactionRepository.insertTransaction(finalEntity)
+            val transferLegs = finalEntity.qualifiedTransferLegsOrNull()
+            val rowId = if (transferLegs != null) {
+                accountBalanceRepository.insertTransferWithBalance(
+                    transaction = finalEntity,
+                    fromBankName = transferLegs.fromBankName,
+                    fromLast4 = transferLegs.fromAccountLast4,
+                    toBankName = transferLegs.toBankName,
+                    toLast4 = transferLegs.toAccountLast4
+                )
+            } else {
+                transactionRepository.insertTransaction(finalEntity)
+            }
             if (rowId != -1L) {
                 Log.d(TAG, "Saved new transaction with ID: $rowId${if (finalEntity.isRecurring) " (Recurring)" else ""}")
 
@@ -181,8 +193,11 @@ class SmsTransactionProcessor @Inject constructor(
                     ruleRepository.saveRuleApplications(ruleApplications)
                 }
 
-                // Process balance updates
-                processBalanceUpdate(parsedTransaction, finalEntity, rowId)
+                // The two-leg repository path already applied explicit transfer
+                // legs. Other transactions use the ownership-aware balance path.
+                if (transferLegs == null) {
+                    processBalanceUpdate(parsedTransaction, finalEntity, rowId)
+                }
 
                 // Trigger widget refresh for the transaction-derived widgets
                 com.pennywiseai.tracker.widget.WidgetRefresher.refreshTransactionWidgets(appContext)
@@ -203,40 +218,32 @@ class SmsTransactionProcessor @Inject constructor(
         entity: TransactionEntity,
         rowId: Long
     ) {
-        if (parsedTransaction.accountLast4 == null) {
-            // Mobile-money wallets (eMola, M-Pesa Mozambique) have no per-account
-            // number — the whole wallet is one account. Derive a single service-level
-            // account row from the running balance the SMS carries, so the wallet shows
-            // up as an account and counts toward the total balance.
-            if (parsedTransaction.isMobileWallet && parsedTransaction.balance != null) {
-                upsertWalletBalance(parsedTransaction, entity, rowId)
-            }
+        val balanceOwner = parsedTransaction.reportedBalanceOwnerOrNull() ?: return
+        if (parsedTransaction.type.toEntityType() == TransactionType.TRANSFER && parsedTransaction.balance == null) {
+            // Persist the ambiguous transfer, but never invent a balance movement.
+            return
+        }
+        if (balanceOwner.kind == BalanceOwnerKind.SERVICE_WALLET) {
+            upsertWalletBalance(parsedTransaction, entity, rowId, balanceOwner.bankName)
             return
         }
 
-        val isFromCard = parsedTransaction.isFromCard
-
-        val targetAccountLast4: String? = if (isFromCard) {
-            var card = parsedTransaction.accountLast4?.let {
-                cardRepository.getCard(parsedTransaction.bankName, it)
-            }
+        val accountLast4 = balanceOwner.accountLast4
+        val targetAccountLast4: String? = if (balanceOwner.kind == BalanceOwnerKind.CARD) {
+            var card = cardRepository.getCard(balanceOwner.bankName, accountLast4)
 
             if (card == null) {
                 val isCredit = (parsedTransaction.type.toEntityType() == TransactionType.CREDIT)
-                parsedTransaction.accountLast4?.let { accountLast4 ->
-                    cardRepository.findOrCreateCard(
-                        cardLast4 = accountLast4,
-                        bankName = parsedTransaction.bankName,
-                        isCredit = isCredit
-                    )
-                }
-                card = parsedTransaction.accountLast4?.let {
-                    cardRepository.getCard(parsedTransaction.bankName, it)
-                }
+                cardRepository.findOrCreateCard(
+                    cardLast4 = accountLast4,
+                    bankName = balanceOwner.bankName,
+                    isCredit = isCredit
+                )
+                card = cardRepository.getCard(balanceOwner.bankName, accountLast4)
             }
 
             if (card == null) {
-                Log.w(TAG, "Could not create/find card for ${parsedTransaction.bankName}")
+                Log.w(TAG, "Could not create/find card for ${balanceOwner.bankName}")
                 null
             } else {
                 // Update card's balance
@@ -262,12 +269,10 @@ class SmsTransactionProcessor @Inject constructor(
 
         if (targetAccountLast4 != null) {
             val isCreditCard = (parsedTransaction.type.toEntityType() == TransactionType.CREDIT) ||
-                    parsedTransaction.accountLast4?.let {
-                        cardRepository.getCard(parsedTransaction.bankName, it)?.cardType
-                    } == CardType.CREDIT
+                    cardRepository.getCard(balanceOwner.bankName, accountLast4)?.cardType == CardType.CREDIT
 
             val existingAccount = accountBalanceRepository.getLatestBalance(
-                parsedTransaction.bankName,
+                balanceOwner.bankName,
                 targetAccountLast4
             )
 
@@ -292,7 +297,7 @@ class SmsTransactionProcessor @Inject constructor(
             }
 
             val balanceEntity = AccountBalanceEntity(
-                bankName = parsedTransaction.bankName,
+                bankName = balanceOwner.bankName,
                 accountLast4 = targetAccountLast4,
                 balance = newBalance,
                 timestamp = entity.dateTime,
@@ -322,16 +327,17 @@ class SmsTransactionProcessor @Inject constructor(
     private suspend fun upsertWalletBalance(
         parsedTransaction: ParsedTransaction,
         entity: TransactionEntity,
-        rowId: Long
+        rowId: Long,
+        walletBankName: String
     ) {
         val balance = parsedTransaction.balance ?: return
         val existingAccount = accountBalanceRepository.getLatestBalance(
-            parsedTransaction.bankName,
+            walletBankName,
             AccountBalanceEntity.WALLET_ACCOUNT_MARKER
         )
 
         val balanceEntity = AccountBalanceEntity(
-            bankName = parsedTransaction.bankName,
+            bankName = walletBankName,
             accountLast4 = AccountBalanceEntity.WALLET_ACCOUNT_MARKER,
             balance = balance,
             timestamp = entity.dateTime,
@@ -347,6 +353,6 @@ class SmsTransactionProcessor @Inject constructor(
         )
 
         accountBalanceRepository.insertBalance(balanceEntity)
-        Log.d(TAG, "Saved wallet balance for ${parsedTransaction.bankName}")
+        Log.d(TAG, "Saved wallet balance for $walletBankName")
     }
 }

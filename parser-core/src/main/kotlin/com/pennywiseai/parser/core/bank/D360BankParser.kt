@@ -27,38 +27,13 @@ class D360BankParser : BankParser() {
         return sender.uppercase().contains("D360")
     }
 
-    override fun extractAmount(message: String): BigDecimal? {
-        // Foreign purchase/withdrawal: "Amount: TRY 342.00 (SAR 27.51)" -> take the SAR conversion.
-        val convertedPattern = Regex(
-            """Amount\s*:\s*[A-Z]{3}\s*[0-9,]+(?:\.\d{1,2})?\s*\(\s*SAR\s*([0-9,]+(?:\.\d{1,2})?)\s*\)""",
-            RegexOption.IGNORE_CASE
-        )
-        convertedPattern.find(message)?.let { match ->
-            return parseAmount(match.groupValues[1])
-        }
-
-        // Local transaction: "Amount: SAR 250.00". Anchored to "Amount:" so the
-        // "Fee: SAR 0.00" line can never be mistaken for the transaction amount.
-        val localPattern = Regex(
-            """Amount\s*:\s*SAR\s*([0-9,]+(?:\.\d{1,2})?)""",
-            RegexOption.IGNORE_CASE
-        )
-        localPattern.find(message)?.let { match ->
-            return parseAmount(match.groupValues[1])
-        }
-
-        return null
-    }
-
-    private fun parseAmount(raw: String): BigDecimal? = try {
-        BigDecimal(raw.replace(",", ""))
-    } catch (e: NumberFormatException) {
-        null
-    }
+    override fun extractAmount(message: String): BigDecimal? =
+        FinancialMessageFields.sarSettlementOrAmount(message, listOf("Amount"))
 
     override fun extractTransactionType(message: String): TransactionType? {
         val lower = message.lowercase()
         return when {
+            lower.contains("account funding") && lower.contains("apple pay") -> TransactionType.TRANSFER
             lower.contains("incoming") -> TransactionType.INCOME
             lower.contains("refund") -> TransactionType.INCOME
             lower.contains("purchase") -> TransactionType.EXPENSE
@@ -103,11 +78,14 @@ class D360BankParser : BankParser() {
     }
 
     override fun isTransactionMessage(message: String): Boolean {
+        if (SaudiTransactionMessageGuards.isDeclinedOrFailed(message) ||
+            SaudiTransactionMessageGuards.isPromotionalOrOperationalNotice(message)
+        ) {
+            return false
+        }
+
         val lower = message.lowercase()
-        if (lower.contains("otp") ||
-            lower.contains("verification code") ||
-            lower.contains("one time password")
-        ) return false
+        if (FinancialMessageSafety.isSecurityCode(message)) return false
 
         // Reject promotional messages that happen to mention transaction words
         // (e.g. "Exclusive SAR cashback offer on all transfers!"). The base class
@@ -119,7 +97,7 @@ class D360BankParser : BankParser() {
         if (promoExact.any { lower.contains(it) } || PROMO_WORDS.containsMatchIn(lower)) return false
 
         val keywords = listOf(
-            "purchase", "withdrawal", "transfer", "incoming", "outgoing", "amount", "sar"
+            "purchase", "withdrawal", "transfer", "incoming", "outgoing", "account funding", "apple pay", "amount", "sar"
         )
         return keywords.any { lower.contains(it) }
     }

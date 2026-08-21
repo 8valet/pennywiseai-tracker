@@ -91,6 +91,37 @@ data class TransactionEntity(
     @ColumnInfo(name = "reference")
     val reference: String? = null,
 
+    // Additive parser-evidence fields. They preserve the distinction between a
+    // funding instrument, a reported-balance owner, and bank-qualified transfer
+    // legs without changing the legacy account_number/from_account/to_account
+    // behavior used by existing transactions.
+    @ColumnInfo(name = "funding_instrument_last4", defaultValue = "NULL")
+    val fundingInstrumentLast4: String? = null,
+
+    @ColumnInfo(name = "funding_instrument_bank_name", defaultValue = "NULL")
+    val fundingInstrumentBankName: String? = null,
+
+    @ColumnInfo(name = "balance_owner_bank_name", defaultValue = "NULL")
+    val balanceOwnerBankName: String? = null,
+
+    @ColumnInfo(name = "balance_owner_account_last4", defaultValue = "NULL")
+    val balanceOwnerAccountLast4: String? = null,
+
+    @ColumnInfo(name = "balance_owner_kind", defaultValue = "NULL")
+    val balanceOwnerKind: String? = null,
+
+    @ColumnInfo(name = "from_bank_name", defaultValue = "NULL")
+    val fromBankName: String? = null,
+
+    @ColumnInfo(name = "to_bank_name", defaultValue = "NULL")
+    val toBankName: String? = null,
+
+    // Optional parser assertion about the legacy account_number suffix. A
+    // COUNTERPARTY or UNKNOWN value prevents SMS balance orchestration from
+    // treating the suffix as a user-owned card/account.
+    @ColumnInfo(name = "account_last4_role", defaultValue = "NULL")
+    val accountLast4Role: String? = null,
+
     @ColumnInfo(name = "loan_id", defaultValue = "NULL")
     val loanId: Long? = null,
 
